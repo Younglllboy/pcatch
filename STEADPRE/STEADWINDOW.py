@@ -14,45 +14,16 @@ import pandas as pd
 
 if __package__:
     from .STEADSPLIT import read_waveform, sha256_file
+    from .WAVEPRE import PreprocessConfig, preprocess_waveform, draw_shift, validate_manifest
 else:
     from STEADSPLIT import read_waveform, sha256_file
+    from WAVEPRE import PreprocessConfig, preprocess_waveform, draw_shift, validate_manifest
 
 
 def prepare_window(raw, p_sample=np.nan, s_sample=np.nan, shift=0, sigma_samples=5.0):
-    """返回 x[3,T], y[1,T], valid_mask[1,T]；不插值/截断 fractional pick。"""
-    raw = np.asarray(raw, dtype=np.float64)
-    if raw.shape != (3, 6000) or not np.isfinite(raw).all():
-        raise ValueError("Expected a finite native (3,6000) window.")
-    n = raw.shape[1]
-    shift = int(shift)
-    if abs(shift) > 500 or sigma_samples <= 0:
-        raise ValueError("Allowed shift is +/-500 samples; sigma must be positive.")
-    p = float(p_sample) + shift if np.isfinite(p_sample) else np.nan
-    s = float(s_sample) + shift if np.isfinite(s_sample) else np.nan
-    if np.isfinite(p) and not 0 <= p < n:
-        raise ValueError("Augmentation would remove P from window.")
-    x = np.zeros_like(raw)
-    start, stop = max(0, shift), min(n, n + shift)
-    x[:, start:stop] = raw[:, start - shift:stop - shift]
-    # 单窗口、有效样本内去均值/线性趋势，联合 RMS 保留分量相对振幅。
-    valid_x = x[:, start:stop]
-    t = np.arange(stop - start, dtype=np.float64)
-    t -= t.mean()
-    valid_x -= valid_x.mean(axis=1, keepdims=True)
-    slopes = (valid_x @ t) / np.dot(t, t)
-    valid_x -= slopes[:, None] * t[None, :]
-    rms = float(np.sqrt(np.mean(valid_x ** 2)))
-    valid_x /= max(rms, 1e-8)
-    mask = np.zeros((1, n), dtype=np.float32)
-    mask[:, start:stop] = 1
-    target = np.zeros((1, n), dtype=np.float32)
-    if np.isfinite(p):
-        target[0] = np.exp(-0.5 * ((np.arange(n) - p) / sigma_samples) ** 2)
-        target *= mask
-    if not start <= s < stop:
-        s = np.nan
-    return {"waveform": x.astype(np.float32), "p_target": target, "valid_mask": mask,
-            "p_sample": np.float32(p), "s_sample": np.float32(s), "shift_samples": shift}
+    """兼容旧入口；唯一预处理实现现位于 WAVEPRE.py，避免训练与验收分叉。"""
+    return preprocess_waveform(raw, p_sample, s_sample, shift,
+                               PreprocessConfig(sigma_seconds=sigma_samples / 100))
 
 
 class STEADWindowDataset:
@@ -62,7 +33,7 @@ class STEADWindowDataset:
     DataLoader 迭代器，且 persistent_workers=False。划分 seed 与训练 seed 相互独立。
     """
 
-    def __init__(self, manifest, data_dir=None, augment=False, seed=42, max_shift_seconds=5.0):
+    def __init__(self, manifest, data_dir=None, augment=False, seed=42, max_shift_seconds=5.0, config=None):
         self.manifest = Path(manifest).resolve()
         summary_path = self.manifest.parent / "summary.json"
         if not summary_path.is_file():
@@ -81,6 +52,8 @@ class STEADWindowDataset:
             raise ValueError("HDF5 changed after the split; audit before training.")
         self.rows = pd.read_csv(self.manifest, keep_default_na=False, low_memory=False,
                                dtype={"source_id": str, "station_key": str})
+        self.config = config or PreprocessConfig(max_shift_seconds=max_shift_seconds)
+        validate_manifest(self.rows, self.config)
         splits = set(self.rows["split"])
         if len(splits) != 1 or not splits <= {"train", "val", "test"}:
             raise ValueError("Dataset must contain exactly one valid split.")
@@ -91,7 +64,7 @@ class STEADWindowDataset:
             raise ValueError("max_shift_seconds must be in [0,5]; seed must be nonnegative.")
         self.augment = augment
         self.seed, self.epoch = int(seed), 0
-        self.max_shift = round(max_shift_seconds * 100)
+        self.max_shift = round(self.config.max_shift_seconds * 100)
         self._handle, self._pid = None, None
 
     def __len__(self):
@@ -116,14 +89,8 @@ class STEADWindowDataset:
             s = np.nan
         shift = 0
         if self.augment:
-            rng = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch, int(row.metadata_row)]))
-            low, high = -self.max_shift, self.max_shift
-            if np.isfinite(p):
-                # 保留完整 +/-3 sigma P 标签，同时不使用循环卷绕。
-                low = max(low, int(np.ceil(15 - p)))
-                high = min(high, int(np.floor(5984 - p)))
-            shift = int(rng.integers(low, high + 1))
-        result = prepare_window(raw, p, s, shift, float(row.p_target_sigma_samples))
+            shift = draw_shift(p, self.seed, self.epoch, int(row.metadata_row), self.config)
+        result = preprocess_waveform(raw, p, s, shift, self.config)
         result.update({"window_id": str(row.window_id), "event_group_key": str(row.event_group_key),
                        "station_key": str(row.station_key), "is_noise": row.kind == "noise"})
         return result
