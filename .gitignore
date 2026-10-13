@@ -4,3 +4,6 @@ datasets/
 /STEADPRE/check_stead_training.py
 /STEADPRE/test_stead_split.py
 /STEADPRE/__pycache__
+/STEADPRE/check_wavepre_training.py
+/STEADPRE/test_wavepre.py
+/STEADPRE/WAVEPREVIEW.py
