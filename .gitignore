@@ -3,3 +3,4 @@ artifacts/
 datasets/
 /STEADPRE/check_stead_training.py
 /STEADPRE/test_stead_split.py
+/STEADPRE/__pycache__
